@@ -1,0 +1,12 @@
+# Dependencies (restore with `bun install`)
+node_modules/
+
+# Secrets
+.env
+
+# SQLite data (links, counters) lives only on the server
+*.db
+*.db-wal
+*.db-shm
+
+.DS_Store

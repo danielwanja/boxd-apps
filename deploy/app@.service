@@ -1,0 +1,15 @@
+[Unit]
+Description=d.boxd.sh app: %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=boxd
+WorkingDirectory=/home/boxd/apps/%i
+EnvironmentFile=-/home/boxd/apps/.env
+ExecStart=/usr/local/bin/bun run server.ts
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
