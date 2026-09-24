@@ -22,7 +22,7 @@ Each app is a single `server.ts`, and they share `shared/lib.ts` (page layout, l
 - Paste a URL and get `d.boxd.sh/go/<slug>`, either random or a custom slug (3–32 characters).
 - Add `+` to any short link (`/go/<slug>+`) to see its stats: clicks, when it was created and when it was last clicked.
 - Your links page lists the links created in your browser (stored in localStorage).
-- `/go/admin` lists every link and lets you delete them. It uses HTTP Basic auth with `ADMIN_PASSWORD` from `.env` (any username).
+- `/go/admin` lists every link and lets you delete them. It uses HTTP Basic auth with `ADMIN_PASSWORD` from `.env` (any username), and locks an IP out for 15 minutes after 10 failed attempts.
 - Links are stored in SQLite (`go/links.db`). Only `http(s)` URLs are accepted, and a short link can't point back to the shortener.
 - Each IP can create 20 links per hour.
 
@@ -54,6 +54,7 @@ Safeguards:
 - Input is strictly validated as a domain or IP.
 - Commands run through `Bun.spawn` with an argument array, never a shell, and with timeouts.
 - The SSL and header tools refuse private, loopback and link-local addresses (SSRF guard).
+- The header tool pins each request to the IP it checked, so DNS rebinding can't reach internal addresses.
 - Each IP can make 30 lookups per minute.
 
 ### Web widgets (`widgets/`)
@@ -170,3 +171,11 @@ shared/lib.ts        layout, CSS, routing mode, escaping, rate limiting
 deploy/app@.service  systemd template unit
 .env.example         ADMIN_PASSWORD, ROUTING
 ```
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for how to report a vulnerability and how the apps are hardened.
+
+## License
+
+[MIT](LICENSE) © 2026 Daniel Wanja

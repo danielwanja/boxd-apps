@@ -1,6 +1,8 @@
 {
   "name": "boxd-apps",
   "private": true,
+  "license": "MIT",
+  "repository": "github:danielwanja/boxd-apps",
   "type": "module",
   "devDependencies": {
     "@types/bun": "^1.4.2",

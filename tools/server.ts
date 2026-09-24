@@ -1,7 +1,9 @@
 import tls from "node:tls";
 import net from "node:net";
+import http from "node:http";
+import https from "node:https";
 import { lookup } from "node:dns/promises";
-import { page, html, json, clientIp, rateLimit, basePath, stripBase } from "../shared/lib";
+import { page, html, json, clientIp, rateLimit, HOSTNAME, basePath, stripBase } from "../shared/lib";
 
 const PORT = Number(process.env.PORT ?? 3002);
 const BASE = basePath("tools");
@@ -20,7 +22,8 @@ function parseTarget(raw: string | null): string {
   }
   s = s.replace(/^\[|\]$/g, "").replace(/\/.*$/, "").replace(/\.$/, "");
   if (net.isIP(s)) return s;
-  s = s.replace(/:\d+$/, "");
+  s = s.replace(/^\[?([^\]]*?)\]?:\d+$/, "$1");
+  if (net.isIP(s)) return s;
   if (!DOMAIN_RE.test(s)) throw new UserError("That doesn't look like a valid domain.");
   return s;
 }
@@ -28,19 +31,24 @@ function parseTarget(raw: string | null): string {
 const privateIps = new net.BlockList();
 for (const [addr, prefix] of [
   ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8], ["169.254.0.0", 16],
-  ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15], ["224.0.0.0", 3],
+  ["172.16.0.0", 12], ["192.0.0.0", 24], ["192.0.2.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15],
+  ["198.51.100.0", 24], ["203.0.113.0", 24], ["224.0.0.0", 3],
 ] as const) privateIps.addSubnet(addr, prefix, "ipv4");
-for (const [addr, prefix] of [["::", 127], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8]] as const)
-  privateIps.addSubnet(addr, prefix, "ipv6");
+// IPv6 (IPv4-mapped addresses are matched by the IPv4 rules): loopback/unspecified, IPv4-translated, NAT64, discard, docs, 6to4, ULA, link-local, multicast.
+for (const [addr, prefix] of [
+  ["::", 127], ["::ffff:0:0:0", 96], ["64:ff9b::", 96], ["64:ff9b:1::", 48], ["100::", 64],
+  ["2001:db8::", 32], ["2002::", 16], ["fc00::", 7], ["fe80::", 10], ["ff00::", 8],
+] as const) privateIps.addSubnet(addr, prefix, "ipv6");
 
 function isPrivate(ip: string): boolean {
-  const mapped = ip.match(/^::ffff:(\d+\.\d+\.\d+\.\d+)$/i);
-  if (mapped) ip = mapped[1];
+  ip = ip.replace(/^\[|\]$/g, "");
+  if (!net.isIP(ip)) return true;
   return privateIps.check(ip, net.isIPv6(ip) ? "ipv6" : "ipv4");
 }
 
 /** Resolve a host to a public IP, refusing anything internal (SSRF guard). */
 async function publicAddress(host: string): Promise<string> {
+  host = host.replace(/^\[|\]$/g, "");
   const addrs = net.isIP(host) ? [{ address: host }] : await lookup(host, { all: true }).catch(() => []);
   if (!addrs.length) throw new UserError(`Could not resolve ${host}.`);
   if (addrs.some((a) => isPrivate(a.address))) throw new UserError("Private and internal addresses are not allowed.");
@@ -138,6 +146,26 @@ function ssl(target: string, port: number): Promise<object> {
   }));
 }
 
+/** GET a URL over a socket pinned to an already-vetted IP, so DNS can't rebind to an internal address. */
+function pinnedGet(url: URL, ip: string): Promise<{ status: number; headers: Record<string, string> }> {
+  const family = net.isIPv6(ip) ? 6 : 4;
+  const lookupPinned = (_h: string, o: any, cb: any) => (o?.all ? cb(null, [{ address: ip, family }]) : cb(null, ip, family));
+  return new Promise((resolve, reject) => {
+    const req = (url.protocol === "https:" ? https : http).request(url, {
+      method: "GET", lookup: lookupPinned as any,
+      headers: { "user-agent": "tools.d.boxd.sh header checker" },
+    }, (res) => {
+      const headers: Record<string, string> = {};
+      for (const [k, v] of Object.entries(res.headers)) if (v !== undefined) headers[k] = Array.isArray(v) ? v.join(", ") : v;
+      resolve({ status: res.statusCode ?? 0, headers });
+      res.destroy();
+    });
+    req.setTimeout(8000, () => req.destroy(new Error("timed out")));
+    req.on("error", (e) => reject(new UserError(`Request failed: ${e.message}`)));
+    req.end();
+  });
+}
+
 async function headers(raw: string) {
   let url: URL;
   try { url = new URL(/^https?:\/\//i.test(raw.trim()) ? raw.trim() : `https://${raw.trim()}`); }
@@ -146,22 +174,14 @@ async function headers(raw: string) {
   for (let i = 0; i < 10; i++) {
     if (url.protocol !== "http:" && url.protocol !== "https:") throw new UserError("Only http(s) URLs are supported.");
     parseTarget(url.hostname);
-    await publicAddress(url.hostname);
+    const ip = await publicAddress(url.hostname);
     const t0 = performance.now();
-    let r: Response;
-    try {
-      r = await fetch(url, {
-        method: "GET", redirect: "manual", signal: AbortSignal.timeout(8000),
-        headers: { "user-agent": "tools.d.boxd.sh header checker" },
-      });
-    } catch (e: any) {
-      throw new UserError(`Request failed: ${e.message}`);
-    }
-    r.body?.cancel();
-    hops.push({ url: url.toString(), status: r.status, timeMs: Math.round(performance.now() - t0), headers: Object.fromEntries(r.headers) });
-    const loc = r.headers.get("location");
-    if (r.status >= 300 && r.status < 400 && loc) url = new URL(loc, url);
-    else break;
+    const r = await pinnedGet(url, ip);
+    hops.push({ url: url.toString(), status: r.status, timeMs: Math.round(performance.now() - t0), headers: r.headers });
+    const loc = r.headers.location;
+    if (r.status >= 300 && r.status < 400 && loc) {
+      try { url = new URL(loc, url); } catch { break; }
+    } else break;
   }
   return { hops };
 }
@@ -273,6 +293,7 @@ select(render[p.get("tool")] ? p.get("tool") : "whois", { run: !!p.get("q"), q: 
 
 Bun.serve({
   port: PORT,
+  hostname: HOSTNAME,
   async fetch(req, server) {
     const url = new URL(req.url);
     const path = stripBase(url.pathname, BASE) ?? "/404";
@@ -289,7 +310,8 @@ Bun.serve({
         case "/api/whois": return json(await whois(parseTarget(q)));
         case "/api/dns": return json(await dns(parseTarget(q)));
         case "/api/ssl": {
-          const port = Number((q ?? "").match(/:(\d{1,5})(?:\/|$)/)?.[1] ?? 443);
+          const bare = (q ?? "").trim();
+          const port = net.isIP(bare) ? 443 : Number(bare.match(/:(\d{1,5})(?:\/|$)/)?.[1] ?? 443);
           if (port < 1 || port > 65535) throw new UserError("Invalid port.");
           return json(await ssl(parseTarget(q), port));
         }

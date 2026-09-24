@@ -12,6 +12,9 @@ export const SITE: Record<"root" | AppName, string> = {
   ...(Object.fromEntries(APPS.map((a) => [a, ROUTING === "path" ? `${ROOT}/${a}` : `https://${a}.d.boxd.sh`])) as Record<AppName, string>),
 };
 
+/** Interface to listen on. In path mode only the landing proxy talks to the apps, so keep them on loopback. */
+export const HOSTNAME = ROUTING === "path" ? "127.0.0.1" : "0.0.0.0";
+
 /** URL path prefix an app is mounted under ("" in subdomain mode). */
 export const basePath = (app: AppName) => (ROUTING === "path" ? `/${app}` : "");
 
@@ -102,29 +105,36 @@ export function page(opts: { title: string; body: string; active?: string; head?
 <main class="wrap">${opts.body}</main></body></html>`;
 }
 
+/** Security headers for every page; a page that must be framed (widgets) passes its own CSP. */
 export function html(body: string, init: ResponseInit = {}): Response {
   const headers = new Headers(init.headers);
   headers.set("content-type", "text/html; charset=utf-8");
+  headers.set("x-content-type-options", "nosniff");
+  headers.set("referrer-policy", "strict-origin-when-cross-origin");
+  if (!headers.has("content-security-policy")) headers.set("content-security-policy", "frame-ancestors 'none'");
   return new Response(body, { ...init, headers });
 }
 
 export function json(data: unknown, status = 200): Response {
-  return Response.json(data, { status });
+  return Response.json(data, { status, headers: { "x-content-type-options": "nosniff" } });
 }
 
-/** Real client IP: the boxd proxy sets X-Forwarded-For. */
+/** Real client IP. The boxd proxy overwrites X-Forwarded-For, so its first entry can't be spoofed. */
 export function clientIp(req: Request, server: { requestIP(r: Request): { address: string } | null }): string {
   const xff = req.headers.get("x-forwarded-for");
   if (xff) return xff.split(",")[0].trim();
   return req.headers.get("x-real-ip") ?? server.requestIP(req)?.address ?? "unknown";
 }
 
-/** Fixed-window in-memory rate limiter. Returns true if the request is allowed. */
+/** Fixed-window in-memory rate limiter. Returns true if the request is allowed. With peek, checks without counting. */
 const buckets = new Map<string, { n: number; reset: number }>();
-export function rateLimit(key: string, limit: number, windowMs: number): boolean {
+const MAX_BUCKETS = 100_000;
+export function rateLimit(key: string, limit: number, windowMs: number, peek = false): boolean {
   const now = Date.now();
   const b = buckets.get(key);
+  if (peek) return !b || b.reset < now || b.n < limit;
   if (!b || b.reset < now) {
+    if (!b && buckets.size >= MAX_BUCKETS) buckets.delete(buckets.keys().next().value!); // bound memory
     buckets.set(key, { n: 1, reset: now + windowMs });
     return true;
   }

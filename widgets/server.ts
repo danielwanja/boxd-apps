@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { page, html, json, esc, clientIp, rateLimit, CSS, SITE, basePath, stripBase } from "../shared/lib";
+import { page, html, json, esc, clientIp, rateLimit, CSS, SITE, HOSTNAME, basePath, stripBase } from "../shared/lib";
 
 /** JSON for inline <script>: escapes "<" so values can't close the script tag. */
 const js = (v: unknown) => JSON.stringify(v).replace(/</g, "\\u003c");
@@ -25,11 +25,14 @@ const WMO: Record<number, [string, string]> = {
   95: ["Thunderstorm", "⛈️"], 96: ["Thunderstorm, hail", "⛈️"], 99: ["Thunderstorm, hail", "⛈️"],
 };
 const weatherCache = new Map<string, { at: number; data: unknown }>();
+const MAX_CACHED_CITIES = 1000;
 
-async function weather(city: string, units: "c" | "f") {
+async function weather(city: string, units: "c" | "f", ip: string) {
   const key = `${city.toLowerCase()}|${units}`;
   const hit = weatherCache.get(key);
   if (hit && Date.now() - hit.at < 10 * 60_000) return hit.data;
+  // Cache misses call Open-Meteo, so limit them per visitor.
+  if (!rateLimit(`weather:${ip}`, 30, 60_000)) return null;
 
   const geo = await fetch(`https://geocoding-api.open-meteo.com/v1/search?count=1&name=${encodeURIComponent(city)}`,
     { signal: AbortSignal.timeout(6000) }).then((r) => r.json()) as any;
@@ -52,6 +55,8 @@ async function weather(city: string, units: "c" | "f") {
     humidity: w.current.relative_humidity_2m, wind: Math.round(w.current.wind_speed_10m),
     windUnit: units === "f" ? "mph" : "km/h", unit: units === "f" ? "°F" : "°C", text, icon,
   };
+  weatherCache.delete(key);
+  if (weatherCache.size >= MAX_CACHED_CITIES) weatherCache.delete(weatherCache.keys().next().value!);
   weatherCache.set(key, { at: Date.now(), data });
   return data;
 }
@@ -85,7 +90,7 @@ ${script}
 </script></body></html>`;
 }
 
-const widgets: Record<string, (p: URLSearchParams) => string | Promise<string>> = {
+const widgets: Record<string, (p: URLSearchParams, ip: string) => string | Promise<string>> = {
   clock(p) {
     const tz = p.get("tz") || "UTC";
     return widgetShell(p, `
@@ -120,11 +125,11 @@ function tick() {
 tick(); setInterval(tick, 1000);`);
   },
 
-  async weather(p) {
+  async weather(p, ip) {
     const city = (p.get("city") || "London").slice(0, 80);
     const units = p.get("units") === "f" ? "f" : "c";
     let w: any = null;
-    try { w = await weather(city, units); } catch {}
+    try { w = await weather(city, units, ip); } catch {}
     if (!w) return widgetShell(p, `<div class="label">Weather</div><div>Couldn't find weather for “${esc(city)}”.</div>`);
     return widgetShell(p, `
 <div class="label">${esc(p.get("label") || w.place)}</div>
@@ -286,6 +291,7 @@ select("clock");
 
 Bun.serve({
   port: PORT,
+  hostname: HOSTNAME,
   async fetch(req, server) {
     const url = new URL(req.url);
     const path = stripBase(url.pathname, BASE) ?? "/404";
@@ -300,7 +306,7 @@ Bun.serve({
 
     const w = path.match(/^\/w\/([a-z]+)$/);
     if (w && widgets[w[1]]) {
-      return html(await widgets[w[1]](url.searchParams), {
+      return html(await widgets[w[1]](url.searchParams, clientIp(req, server)), {
         headers: { "content-security-policy": "frame-ancestors *", "cache-control": "no-cache" },
       });
     }

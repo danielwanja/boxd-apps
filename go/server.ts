@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
-import { page, html, json, esc, clientIp, rateLimit, SITE, basePath, stripBase } from "../shared/lib";
+import { timingSafeEqual } from "node:crypto";
+import { page, html, json, esc, clientIp, rateLimit, SITE, HOSTNAME, basePath, stripBase } from "../shared/lib";
 
 const PORT = Number(process.env.PORT ?? 3001);
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD ?? "";
@@ -36,6 +37,7 @@ function randomSlug(len = 6): string {
 }
 
 function validUrl(raw: string): string | null {
+  if (raw.length > 2048) return null;
   try {
     const u = new URL(raw.trim());
     if (u.protocol !== "http:" && u.protocol !== "https:") return null;
@@ -50,8 +52,18 @@ function authorized(req: Request): boolean {
   if (!ADMIN_PASSWORD) return false;
   const h = req.headers.get("authorization") ?? "";
   if (!h.startsWith("Basic ")) return false;
-  const [, pass] = atob(h.slice(6)).split(/:(.*)/s);
-  return pass === ADMIN_PASSWORD;
+  let pass = "";
+  try { pass = atob(h.slice(6)).split(/:(.*)/s)[1] ?? ""; } catch { return false; }
+  const a = Buffer.from(pass), b = Buffer.from(ADMIN_PASSWORD);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+/** Browsers send Basic credentials on cross-site form posts, so admin writes must come from our own pages. */
+function sameOrigin(req: Request): boolean {
+  const site = req.headers.get("sec-fetch-site");
+  if (site) return site === "same-origin";
+  const origin = req.headers.get("origin");
+  return origin === null || origin === new URL(SITE.go).origin;
 }
 
 const home = page({
@@ -155,9 +167,12 @@ const notFound = () =>
 
 Bun.serve({
   port: PORT,
+  hostname: HOSTNAME,
   async fetch(req, server) {
     const url = new URL(req.url);
-    const path = stripBase(decodeURIComponent(url.pathname), BASE);
+    let decoded: string;
+    try { decoded = decodeURIComponent(url.pathname); } catch { return notFound(); }
+    const path = stripBase(decoded, BASE);
     if (path === null) return notFound();
 
     if (path === "/health") return new Response("ok");
@@ -189,12 +204,16 @@ Bun.serve({
     }
 
     if (path === "/admin" || path === "/admin/delete") {
+      const ip = clientIp(req, server);
+      if (!rateLimit(`admin-fail:${ip}`, 10, 15 * 60_000, true)) return new Response("Too many attempts", { status: 429 });
       if (!authorized(req)) {
+        rateLimit(`admin-fail:${ip}`, 10, 15 * 60_000);
         return new Response("Authentication required", {
           status: 401, headers: { "www-authenticate": 'Basic realm="go admin"' },
         });
       }
       if (path === "/admin/delete" && req.method === "POST") {
+        if (!sameOrigin(req)) return new Response("Cross-site request refused", { status: 403 });
         const fd = await req.formData();
         q.del.run(String(fd.get("slug") ?? ""));
         return Response.redirect(`${SITE.go}/admin`, 303);
