@@ -121,12 +121,14 @@ journalctl -u app@tools -f
 
 ### 5. Auto-suspend
 
-boxd puts idle VMs into standby, and they wake in under a millisecond on the next request, so a web app keeps working. We switched it off on this VM so the apps are always running; switch it back on to save costs:
+After 15 minutes with no inbound traffic, boxd puts the VM into standby, which uses no CPU or billable memory. The first request wakes it in under a millisecond, so the apps stay available while costing almost nothing when idle. This VM uses the default:
 
 ```bash
 boxd info                                          # shows the auto-suspend setting
-boxd machine config set auto-suspend.timeout 900   # standby after 15 minutes idle
+boxd machine config set auto-suspend.timeout 900   # standby after 15 minutes idle (0 disables)
 ```
+
+The trap is CPU-only or timer-driven work (cron, long batch jobs), which looks idle and gets paused. Scheduled work belongs in boxd's `run` automations, which wake the VM when a job is due.
 
 ### 6. Built with an agent on the VM
 
